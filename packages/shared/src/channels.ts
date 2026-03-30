@@ -128,6 +128,8 @@ export const IPCChannel = {
   AiChat: "nextshell:ai:chat",
   AiApprove: "nextshell:ai:approve",
   AiAbort: "nextshell:ai:abort",
+  AiResolveTimeout: "nextshell:ai:resolve-timeout",
+  AiAnalyzeCurrentExecution: "nextshell:ai:analyze-current-execution",
   AiHistory: "nextshell:ai:history",
   AiExportConversation: "nextshell:ai:export-conversation",
   AiProviderTest: "nextshell:ai:provider:test",

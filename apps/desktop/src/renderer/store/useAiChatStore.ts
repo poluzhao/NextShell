@@ -45,7 +45,7 @@ export const getAiClientId = (): string => {
   }
 };
 
-export type ExecutionPhase = "executing" | "collecting" | "analyzing" | "receiving";
+export type ExecutionPhase = "probing" | "executing" | "collecting" | "analyzing" | "receiving";
 
 /** 当前 AI 面板的活动状态提示 */
 export interface StatusHint {
@@ -53,6 +53,11 @@ export interface StatusHint {
   text: string;
   /** 是否显示动画 */
   animate?: boolean;
+}
+
+interface TimeoutPromptState {
+  step: number;
+  kind: "startup" | "idle" | "runtime";
 }
 
 interface AiChatState {
@@ -74,6 +79,7 @@ interface AiChatState {
   recoveryPlanSourceStep?: number;
   pendingPlan?: AiExecutionPlan;
   pendingPlanUserRequest?: string;
+  timeoutPrompt?: TimeoutPromptState;
   showHistory: boolean;
   statusHint?: StatusHint;
 
@@ -84,6 +90,8 @@ interface AiChatState {
   sendMessage: (content: string) => Promise<void>;
   approvePlan: (editedPlan?: AiExecutionPlan) => Promise<void>;
   abortExecution: () => Promise<void>;
+  resolveTimeoutPrompt: (action: "continue" | "abort") => Promise<void>;
+  analyzeCurrentExecution: () => Promise<void>;
   newConversation: () => void;
   setShowHistory: (show: boolean) => void;
   switchConversation: (conversationId: string) => void;
@@ -169,6 +177,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
   recoveryPlanSourceStep: undefined,
   pendingPlan: undefined,
   pendingPlanUserRequest: undefined,
+  timeoutPrompt: undefined,
   showHistory: false,
   statusHint: undefined,
 
@@ -219,6 +228,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       recoveryPlanSourceStep: undefined,
       pendingPlan: restored?.plan,
       pendingPlanUserRequest: restored?.userRequest,
+      timeoutPrompt: undefined,
       showHistory: false,
       statusHint: restored ? { icon: "ri-file-list-3-line", text: "有待审批的执行计划" } : undefined,
     });
@@ -236,6 +246,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       recoveryPlanSourceStep: undefined,
       pendingPlan: undefined,
       pendingPlanUserRequest: content,
+      timeoutPrompt: undefined,
       statusHint: { icon: "ri-loader-4-line", text: "正在连接 AI 模型...", animate: true },
     });
 
@@ -302,6 +313,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       recoveryPlan: undefined,
       recoveryPlanSourceStep: undefined,
       pendingPlan: undefined,
+      timeoutPrompt: undefined,
       executionPhase: "executing",
       executionProgress: {
         planSummary: planToExecute.summary ?? "",
@@ -330,6 +342,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
         executionProgress: undefined,
         executionPhase: undefined,
         pendingPlan: planToExecute,
+        timeoutPrompt: undefined,
         statusHint: {
           icon: "ri-error-warning-line",
           text: summarizeAiError(
@@ -357,8 +370,63 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       recoveryPlan: undefined,
       recoveryPlanSourceStep: undefined,
       pendingPlan: undefined,
+      timeoutPrompt: undefined,
       statusHint: undefined,
     });
+  },
+
+  resolveTimeoutPrompt: async (action) => {
+    const state = get();
+    if (!state.activeConversationId || !state.timeoutPrompt) return;
+
+    await window.nextshell.ai.resolveTimeout({
+      conversationId: state.activeConversationId,
+      clientId: getAiClientId(),
+      action,
+    });
+
+    set({
+      timeoutPrompt: undefined,
+      statusHint: action === "continue"
+        ? { icon: "ri-time-line", text: "继续等待当前步骤完成...", animate: true }
+        : { icon: "ri-stop-circle-line", text: "已请求终止当前执行..." },
+    });
+  },
+
+  analyzeCurrentExecution: async () => {
+    const state = get();
+    if (!state.activeConversationId) return;
+
+    set({
+      isStreaming: true,
+      streamingContent: "",
+      executionPhase: "analyzing",
+      statusHint: {
+        icon: "ri-brain-line",
+        text: "正在分析当前输出...",
+        animate: true,
+      },
+    });
+
+    try {
+      await window.nextshell.ai.analyzeCurrentExecution({
+        conversationId: state.activeConversationId,
+        clientId: getAiClientId(),
+      });
+    } catch (error) {
+      set({
+        isStreaming: false,
+        executionPhase: state.executionProgress?.completed ? undefined : state.executionPhase,
+        statusHint: {
+          icon: "ri-error-warning-line",
+          text: summarizeAiError(
+            error instanceof Error ? error.message : String(error),
+            "分析当前输出失败"
+          ),
+        },
+      });
+      throw error;
+    }
   },
 
   newConversation: () => {
@@ -373,6 +441,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       recoveryPlanSourceStep: undefined,
       pendingPlan: undefined,
       pendingPlanUserRequest: undefined,
+      timeoutPrompt: undefined,
       showHistory: false,
       statusHint: undefined,
     });
@@ -397,6 +466,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       recoveryPlanSourceStep: undefined,
       pendingPlan: restored?.plan,
       pendingPlanUserRequest: restored?.userRequest,
+      timeoutPrompt: undefined,
       showHistory: false,
       statusHint: restored ? { icon: "ri-file-list-3-line", text: "有待审批的执行计划" } : undefined,
     });
@@ -433,11 +503,17 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       const updates: Partial<AiChatState> = {
         streamingContent: state.streamingContent + event.token,
         isStreaming: true,
-        statusHint: { icon: "ri-robot-2-line", text: "AI 正在回复...", animate: true },
+        statusHint: event.preserveExecutionState
+          ? state.executionProgress?.completed
+            ? { icon: "ri-robot-2-line", text: "AI 正在分析失败原因...", animate: true }
+            : { icon: "ri-robot-2-line", text: "AI 正在分析当前输出...", animate: true }
+          : { icon: "ri-robot-2-line", text: "AI 正在回复...", animate: true },
       };
       if (state.executionPhase === "analyzing") {
         updates.executionPhase = "receiving";
-        updates.statusHint = { icon: "ri-robot-2-line", text: "正在接收分析结论...", animate: true };
+        updates.statusHint = event.preserveExecutionState && !state.executionProgress?.completed
+          ? { icon: "ri-robot-2-line", text: "正在接收当前分析结论...", animate: true }
+          : { icon: "ri-robot-2-line", text: "正在接收分析结论...", animate: true };
       }
       set(updates);
     }
@@ -448,16 +524,28 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
         summary: event.plan.summary,
       };
       if (isActiveConv) {
-        set({
-          pendingPlan: plan,
-          isStreaming: false,
-          executionProgress: undefined,
-          executionPhase: undefined,
-          currentApprovedPlan: undefined,
-          recoveryPlan: undefined,
-          recoveryPlanSourceStep: undefined,
-          statusHint: { icon: "ri-file-list-3-line", text: "已生成执行计划，等待审批" },
-        });
+        if (event.preserveExecutionState) {
+          set({
+            pendingPlan: plan,
+            isStreaming: false,
+            timeoutPrompt: undefined,
+            statusHint: state.executionProgress?.completed
+              ? { icon: "ri-lightbulb-line", text: "AI 已给出失败分析和新计划，可手动重试或审批新计划" }
+              : { icon: "ri-information-line", text: "AI 已基于当前输出给出建议，可继续等待或参考下方回复" },
+          });
+        } else {
+          set({
+            pendingPlan: plan,
+            isStreaming: false,
+            executionProgress: undefined,
+            executionPhase: undefined,
+            currentApprovedPlan: undefined,
+            recoveryPlan: undefined,
+            recoveryPlanSourceStep: undefined,
+            timeoutPrompt: undefined,
+            statusHint: { icon: "ri-file-list-3-line", text: "已生成执行计划，等待审批" },
+          });
+        }
       } else {
         const backgroundConv = state.conversations.find((conv) => conv.id === event.conversationId);
         if (
@@ -478,7 +566,23 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
 
     if (event.type === "done") {
       if (isActiveConv) {
-        set({ isStreaming: false, executionProgress: undefined, executionPhase: undefined, statusHint: undefined });
+        if (event.preserveExecutionState) {
+          set({
+            isStreaming: false,
+            timeoutPrompt: undefined,
+            statusHint: state.executionProgress?.completed
+              ? { icon: "ri-information-line", text: "AI 已完成失败分析，可手动重试或参考下方回复" }
+              : { icon: "ri-information-line", text: "AI 已完成当前输出分析，可继续等待或参考下方回复" },
+          });
+        } else {
+          set({
+            isStreaming: false,
+            executionProgress: undefined,
+            executionPhase: undefined,
+            timeoutPrompt: undefined,
+            statusHint: undefined,
+          });
+        }
       }
       if (event.fullContent) {
         addAssistantMessage(event.conversationId, event.fullContent);
@@ -490,6 +594,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       if (isActiveConv) {
         set({
           isStreaming: false,
+          timeoutPrompt: undefined,
           statusHint: { icon: "ri-error-warning-line", text: summarizeAiError(event.error, "AI 请求失败") },
         });
       }
@@ -525,6 +630,23 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
     if (!isActiveConv) return;
 
     set((s) => {
+      if (event.type === "timeout_prompt" && event.step !== undefined) {
+        return {
+          timeoutPrompt: {
+            step: event.step,
+            kind: event.timeoutKind ?? "idle",
+          },
+          statusHint: {
+            icon: "ri-time-line",
+            text: event.timeoutKind === "startup"
+              ? `步骤 ${event.step} 启动超时，请选择继续等待或终止执行`
+              : event.timeoutKind === "runtime"
+                ? `步骤 ${event.step} 执行时间过长，请选择继续等待或终止执行`
+                : `步骤 ${event.step} 长时间无新输出，请选择继续等待或终止执行`,
+          },
+        };
+      }
+
       const progress = s.executionProgress;
       if (!progress) return {};
 
@@ -537,6 +659,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
         }
         return {
           executionPhase: "executing" as const,
+          timeoutPrompt: undefined,
           executionProgress: {
             ...progress,
             steps: updatedSteps,
@@ -561,12 +684,46 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
         }
         return {
           executionPhase: "collecting" as const,
+          timeoutPrompt: undefined,
           executionProgress: { ...progress, steps: updatedSteps },
           statusHint: {
             icon: event.status === "success" ? "ri-check-line" : "ri-close-line",
             text: `步骤 ${event.step} ${event.status === "success" ? "执行成功" : "执行失败"}`,
           },
         };
+      }
+
+      if (event.type === "step_probe" && event.step !== undefined) {
+        const idx = updatedSteps.findIndex((st) => st.step === event.step);
+        if (idx >= 0 && event.output) {
+          updatedSteps[idx] = {
+            ...updatedSteps[idx]!,
+            output: event.output,
+          };
+        }
+        if (event.status === "running") {
+          return {
+            executionPhase: "probing" as const,
+            timeoutPrompt: undefined,
+            executionProgress: { ...progress, steps: updatedSteps },
+            statusHint: {
+              icon: "ri-radar-line",
+              text: `正在确认步骤 ${event.step} 是否已正常启动...`,
+              animate: true,
+            },
+          };
+        }
+        if (event.status === "success") {
+          return {
+            executionPhase: "executing" as const,
+            timeoutPrompt: undefined,
+            executionProgress: { ...progress, steps: updatedSteps },
+            statusHint: {
+              icon: "ri-pulse-line",
+              text: `已捕获步骤 ${event.step} 的启动输出，继续等待执行完成...`,
+            },
+          };
+        }
       }
 
       if (event.type === "step_output" && event.step !== undefined) {
@@ -579,6 +736,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
         }
         return {
           executionPhase: "collecting" as const,
+          timeoutPrompt: undefined,
           executionProgress: { ...progress, steps: updatedSteps },
         };
       }
@@ -592,6 +750,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
         }
         return {
           executionPhase: "analyzing" as const,
+          timeoutPrompt: undefined,
           executionProgress: { ...progress, steps: updatedSteps },
           statusHint: { icon: "ri-brain-line", text: "正在将执行结果提交 AI 分析...", animate: true },
         };
@@ -604,6 +763,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
           currentApprovedPlan: undefined,
           recoveryPlan: undefined,
           recoveryPlanSourceStep: undefined,
+          timeoutPrompt: undefined,
           statusHint: undefined,
         };
       }
@@ -621,6 +781,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
         }
         return {
           executionPhase: undefined,
+          timeoutPrompt: undefined,
           executionProgress: {
             ...progress,
             steps: updatedSteps,
@@ -661,6 +822,7 @@ export const useAiChatStore = create<AiChatState>((set, get) => ({
       pendingPlan: state.recoveryPlan,
       executionProgress: undefined,
       executionPhase: undefined,
+      timeoutPrompt: undefined,
       statusHint: {
         icon: "ri-edit-2-line",
         text: state.recoveryPlanSourceStep

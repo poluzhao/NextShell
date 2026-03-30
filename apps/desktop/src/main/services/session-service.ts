@@ -15,13 +15,13 @@ import type {
   SessionStatusEvent,
   StreamDeliveryAckInput,
 } from "@nextshell/shared";
-import { AUTH_REQUIRED_PREFIX, IPCChannel } from "@nextshell/shared";
+import { AUTH_REQUIRED_PREFIX } from "@nextshell/shared";
 import type { CachedConnectionRepository } from "@nextshell/storage";
-import type { ActiveSession, ActiveRemoteSession, SystemMonitorRuntime } from "./container-types";
+import type { ActiveSession, SystemMonitorRuntime } from "./container-types";
 import { normalizeError, toAuthRequiredReason, decodeTerminalData, encodeTerminalData } from "./container-utils";
 import { createRemoteOsc7BootstrapPlan, resolveOsc7ShellFamily } from "./terminal-osc7-bootstrap";
 import { resolveLocalShellLaunch } from "./local-shell";
-import type { createOrderedBytesDispatcher, LatestOnlyDispatcher, LatestOnlyAckInput } from "./ipc-stream-dispatcher";
+import type { createOrderedBytesDispatcher, LatestOnlyDispatcher } from "./ipc-stream-dispatcher";
 import { logger } from "../logger";
 
 export interface SessionServiceOptions {
@@ -50,6 +50,10 @@ export interface SessionServiceOptions {
 interface SessionExecOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  startupTimeoutMs?: number;
+  idleTimeoutMs?: number;
+  onOutput?: (output: string) => void;
+  onTimeoutPrompt?: (kind: "startup" | "idle" | "runtime") => Promise<"continue" | "abort">;
 }
 
 interface SessionVisibleFilter {
@@ -60,6 +64,10 @@ interface SessionVisibleFilter {
   buffer: string;
   suppressNextNewline: boolean;
 }
+
+type SessionExecParseState = "waiting_start" | "capturing_output" | "capturing_exit" | "done";
+
+const SESSION_EXEC_PREVIEW_LIMIT = 8000;
 
 export class SessionService {
   private readonly connections: CachedConnectionRepository;
@@ -480,14 +488,116 @@ export class SessionService {
       "__ns_ai_exit=$?",
       `printf '%b%s%b' '${this.encodeShellBytes(endPrefix)}' "$__ns_ai_exit" '${this.encodeShellBytes(endSuffix)}'`,
     ].join("; ");
-    const chunks: string[] = [];
 
     return await new Promise<CommandExecutionResult>((resolve, reject) => {
       let settled = false;
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let startupTimeoutId: ReturnType<typeof setTimeout> | undefined;
+      let idleTimeoutId: ReturnType<typeof setTimeout> | undefined;
+      let runtimeTimeoutId: ReturnType<typeof setTimeout> | undefined;
+      let parseState: SessionExecParseState = "waiting_start";
+      let parserBuffer = "";
+      const observedOutputChunks: string[] = [];
+      let observedOutputPreview = "";
+      let exitCodeBuffer = "";
+      let parsedExitCode: number | undefined;
+      let lastEmittedPreview = "";
+      let commandStarted = false;
+      let waitingTimeoutDecision = false;
+      const startupTimeoutMs = options?.startupTimeoutMs ?? options?.timeoutMs;
+      const idleTimeoutMs = options?.idleTimeoutMs;
+      const runtimeTimeoutMs = options?.timeoutMs;
+
+      const clearStartupTimeout = (): void => {
+        if (startupTimeoutId) {
+          clearTimeout(startupTimeoutId);
+          startupTimeoutId = undefined;
+        }
+      };
+
+      const clearIdleTimeout = (): void => {
+        if (idleTimeoutId) {
+          clearTimeout(idleTimeoutId);
+          idleTimeoutId = undefined;
+        }
+      };
+
+      const clearRuntimeTimeout = (): void => {
+        if (runtimeTimeoutId) {
+          clearTimeout(runtimeTimeoutId);
+          runtimeTimeoutId = undefined;
+        }
+      };
+
+      const armIdleTimeout = (): void => {
+        clearIdleTimeout();
+        if (!Number.isFinite(idleTimeoutMs) || (idleTimeoutMs ?? 0) <= 0) {
+          return;
+        }
+        idleTimeoutId = setTimeout(() => {
+          void handleTimeoutPrompt("idle", "远端命令空闲超时");
+        }, idleTimeoutMs);
+      };
+
+      const armRuntimeTimeout = (): void => {
+        clearRuntimeTimeout();
+        if (!Number.isFinite(runtimeTimeoutMs) || (runtimeTimeoutMs ?? 0) <= 0) {
+          return;
+        }
+        runtimeTimeoutId = setTimeout(() => {
+          void handleTimeoutPrompt("runtime", "远端命令执行超时");
+        }, runtimeTimeoutMs);
+      };
+
+      const handleTimeoutPrompt = async (
+        kind: "startup" | "idle" | "runtime",
+        errorMessage: string
+      ): Promise<void> => {
+        if (settled || waitingTimeoutDecision) {
+          return;
+        }
+        clearStartupTimeout();
+        clearIdleTimeout();
+        clearRuntimeTimeout();
+        if (!options?.onTimeoutPrompt) {
+          this.interruptSession(sessionId);
+          finalize(() => reject(new Error(errorMessage)));
+          return;
+        }
+
+        waitingTimeoutDecision = true;
+        try {
+          const action = await options.onTimeoutPrompt(kind);
+          waitingTimeoutDecision = false;
+          if (settled) {
+            return;
+          }
+          if (action === "continue") {
+            if (kind === "startup") {
+              if (Number.isFinite(startupTimeoutMs) && (startupTimeoutMs ?? 0) > 0) {
+                startupTimeoutId = setTimeout(() => {
+                  void handleTimeoutPrompt("startup", "远端命令启动超时");
+                }, startupTimeoutMs);
+              }
+            } else if (kind === "runtime") {
+              armRuntimeTimeout();
+            } else {
+              armIdleTimeout();
+            }
+            return;
+          }
+
+          this.interruptSession(sessionId);
+          finalize(() => reject(new Error(errorMessage)));
+        } catch (error) {
+          waitingTimeoutDecision = false;
+          finalize(() => reject(error));
+        }
+      };
 
       const cleanup = (): void => {
-        if (timeoutId) clearTimeout(timeoutId);
+        clearStartupTimeout();
+        clearIdleTimeout();
+        clearRuntimeTimeout();
         this.removeSessionOutputListener(sessionId, onChunk);
         this.removeSessionCloseListener(sessionId, onSessionClose);
         options?.signal?.removeEventListener("abort", onAbort);
@@ -505,26 +615,40 @@ export class SessionService {
         callback();
       };
 
-      const extractCommandResult = (): CommandExecutionResult | undefined => {
-        const rawOutput = chunks.join("");
-        const startIndex = rawOutput.indexOf(startSentinel);
-        if (startIndex < 0) {
-          return undefined;
+      const appendObservedOutput = (chunk: string): void => {
+        if (!chunk) {
+          return;
         }
-        const payloadStart = startIndex + startSentinel.length;
-        const endIndex = rawOutput.indexOf(endPrefix, payloadStart);
-        if (endIndex < 0) {
-          return undefined;
-        }
-        const exitStart = endIndex + endPrefix.length;
-        const exitEnd = rawOutput.indexOf(endSuffix, exitStart);
-        if (exitEnd < 0) {
-          return undefined;
-        }
+        observedOutputChunks.push(chunk);
+        observedOutputPreview = this.appendSessionExecPreview(observedOutputPreview, chunk);
+      };
 
-        const payload = rawOutput.slice(payloadStart, endIndex);
-        const exitCodeRaw = rawOutput.slice(exitStart, exitEnd).trim();
-        const parsedExitCode = Number.parseInt(exitCodeRaw, 10);
+      const emitObservedPreview = (preview = observedOutputPreview): void => {
+        if (!options?.onOutput) {
+          return;
+        }
+        const normalizedPreview = preview.replace(/^\r?\n/, "");
+        if (normalizedPreview === lastEmittedPreview) {
+          return;
+        }
+        lastEmittedPreview = normalizedPreview;
+        options.onOutput(normalizedPreview);
+      };
+
+      const markObservedOutput = (preview = observedOutputPreview): void => {
+        emitObservedPreview(preview);
+        if (preview.replace(/\r/g, "").trim().length > 0) {
+          waitingTimeoutDecision = false;
+          if (!commandStarted) {
+            commandStarted = true;
+            clearStartupTimeout();
+          }
+          armIdleTimeout();
+        }
+      };
+
+      const buildCommandResult = (): CommandExecutionResult => {
+        const payload = observedOutputChunks.join("");
         const normalizedOutput = payload
           .replace(/^\r?\n/, "")
           .replace(/\r?\n$/, "");
@@ -534,16 +658,66 @@ export class SessionService {
           command,
           stdout: normalizedOutput,
           stderr: "",
-          exitCode: Number.isFinite(parsedExitCode) ? parsedExitCode : 1,
+          exitCode: typeof parsedExitCode === "number" ? parsedExitCode : 1,
           executedAt: new Date().toISOString(),
         };
       };
 
       const onChunk = (chunk: string): void => {
-        chunks.push(chunk);
-        const result = extractCommandResult();
-        if (result) {
-          finalize(() => resolve(result));
+        parserBuffer += chunk;
+
+        while (parserBuffer.length > 0 && parseState !== "done") {
+          if (parseState === "waiting_start") {
+            const startIndex = parserBuffer.indexOf(startSentinel);
+            if (startIndex < 0) {
+              const keep = Math.max(startSentinel.length - 1, 0);
+              parserBuffer = keep > 0 ? parserBuffer.slice(-keep) : "";
+              break;
+            }
+            parserBuffer = parserBuffer.slice(startIndex + startSentinel.length);
+            parseState = "capturing_output";
+            continue;
+          }
+
+          if (parseState === "capturing_output") {
+            const endIndex = parserBuffer.indexOf(endPrefix);
+            if (endIndex < 0) {
+              const safeLength = Math.max(parserBuffer.length - endPrefix.length + 1, 0);
+              if (safeLength > 0) {
+                appendObservedOutput(parserBuffer.slice(0, safeLength));
+                parserBuffer = parserBuffer.slice(safeLength);
+                markObservedOutput();
+              } else if (parserBuffer.length > 0) {
+                markObservedOutput(this.appendSessionExecPreview(observedOutputPreview, parserBuffer));
+              }
+              break;
+            }
+
+            appendObservedOutput(parserBuffer.slice(0, endIndex));
+            parserBuffer = parserBuffer.slice(endIndex + endPrefix.length);
+            parseState = "capturing_exit";
+            markObservedOutput();
+            continue;
+          }
+
+          if (parseState === "capturing_exit") {
+            const exitEnd = parserBuffer.indexOf(endSuffix);
+            if (exitEnd < 0) {
+              const safeLength = Math.max(parserBuffer.length - endSuffix.length + 1, 0);
+              if (safeLength > 0) {
+                exitCodeBuffer += parserBuffer.slice(0, safeLength);
+                parserBuffer = parserBuffer.slice(safeLength);
+              }
+              break;
+            }
+
+            exitCodeBuffer += parserBuffer.slice(0, exitEnd);
+            parsedExitCode = Number.parseInt(exitCodeBuffer.trim(), 10);
+            parserBuffer = parserBuffer.slice(exitEnd + endSuffix.length);
+            parseState = "done";
+            finalize(() => resolve(buildCommandResult()));
+            return;
+          }
         }
       };
 
@@ -575,12 +749,12 @@ export class SessionService {
 
       options?.signal?.addEventListener("abort", onAbort, { once: true });
 
-      if (Number.isFinite(options?.timeoutMs) && (options?.timeoutMs ?? 0) > 0) {
-        timeoutId = setTimeout(() => {
-          this.interruptSession(sessionId);
-          finalize(() => reject(new Error("远端命令执行超时")));
-        }, options?.timeoutMs);
+      if (Number.isFinite(startupTimeoutMs) && (startupTimeoutMs ?? 0) > 0) {
+        startupTimeoutId = setTimeout(() => {
+          void handleTimeoutPrompt("startup", "远端命令启动超时");
+        }, startupTimeoutMs);
       }
+      armRuntimeTimeout();
 
       try {
         this.writeSession(sessionId, `${wrappedCommand}\r`);
@@ -790,6 +964,14 @@ export class SessionService {
     for (const listener of listeners) {
       listener(chunk);
     }
+  }
+
+  private appendSessionExecPreview(currentPreview: string, chunk: string): string {
+    const appended = currentPreview + chunk;
+    if (appended.length <= SESSION_EXEC_PREVIEW_LIMIT) {
+      return appended;
+    }
+    return appended.slice(-SESSION_EXEC_PREVIEW_LIMIT);
   }
 
   private addSessionCloseListener(sessionId: string, listener: (reason?: string) => void): void {

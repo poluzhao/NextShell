@@ -20,6 +20,8 @@ import type {
   AiChatInput,
   AiApproveInput,
   AiAbortInput,
+  AiResolveTimeoutInput,
+  AiAnalyzeCurrentExecutionInput,
   AiHistoryInput,
   AiExportConversationInput,
   AiProviderTestInput,
@@ -30,7 +32,7 @@ import { IPCChannel } from "../../../../../../packages/shared/src/index";
 import type { EncryptedSecretVault } from "../../../../../../packages/security/src/index";
 import type { ChatMessage } from "./adapters/types";
 import { LlmRouter } from "./llm-router";
-import { SYSTEM_PROMPT, buildAnalysisPrompt } from "./prompt-templates";
+import { SYSTEM_PROMPT, buildAnalysisPrompt, buildProgressAnalysisPrompt } from "./prompt-templates";
 import { extractPlanFromResponse } from "./plan-parser";
 import { normalizeApprovedPlan } from "./plan-guard";
 import { AiExecutionCoordinator } from "./ai-execution-coordinator";
@@ -117,6 +119,16 @@ interface AiTaskContext {
   chatController?: AbortController;
   executionController?: AbortController;
   analysisController?: AbortController;
+  currentExecution?: {
+    step: number;
+    command: string;
+    output: string;
+  };
+  timeoutPrompt?: {
+    step: number;
+    kind: "startup" | "idle" | "runtime";
+    resolve: (action: "continue" | "abort") => void;
+  };
   aborted: boolean;
 }
 
@@ -129,7 +141,14 @@ interface AiServiceDeps {
   execInSession: (
     sessionId: string,
     cmd: string,
-    options?: { signal?: AbortSignal; timeoutMs?: number }
+    options?: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      startupTimeoutMs?: number;
+      idleTimeoutMs?: number;
+      onOutput?: (output: string) => void;
+      onTimeoutPrompt?: (kind: "startup" | "idle" | "runtime") => Promise<"continue" | "abort">;
+    }
   ) => Promise<CommandExecutionResult>;
   vault: EncryptedSecretVault;
   getPreferences: () => AppPreferences;
@@ -547,6 +566,7 @@ export class AiService {
     current.chatController?.abort(new AiTaskAbortedError());
     current.executionController?.abort(new AiTaskAbortedError());
     current.analysisController?.abort(new AiTaskAbortedError());
+    current.timeoutPrompt?.resolve("abort");
     const next: AiTaskContext = { aborted: false };
     this.taskContexts.set(conversationId, next);
     return next;
@@ -556,6 +576,37 @@ export class AiService {
     if (this.taskContexts.get(conversationId)?.aborted) {
       throw new AiTaskAbortedError();
     }
+  }
+
+  private requestTimeoutDecision(
+    sender: WebContents,
+    conversationId: string,
+    step: number,
+    timeoutKind: "startup" | "idle" | "runtime"
+  ): Promise<"continue" | "abort"> {
+    const context = this.getTaskContext(conversationId);
+    context.timeoutPrompt?.resolve("abort");
+
+    return new Promise<"continue" | "abort">((resolve) => {
+      context.timeoutPrompt = {
+        step,
+        kind: timeoutKind,
+        resolve: (action) => {
+          const latest = this.taskContexts.get(conversationId);
+          if (latest?.timeoutPrompt?.step === step && latest.timeoutPrompt.kind === timeoutKind) {
+            latest.timeoutPrompt = undefined;
+          }
+          resolve(action);
+        },
+      };
+      this.emitToSender(sender, IPCChannel.AiProgressEvent, {
+        conversationId,
+        type: "timeout_prompt",
+        step,
+        timeoutKind,
+        status: "running",
+      } satisfies AiProgressEvent);
+    });
   }
 
   private isAbortError(error: unknown): boolean {
@@ -605,6 +656,94 @@ export class AiService {
     await this.deps.vault.storeCredential(ref, apiKey);
     this.apiKeys.set(providerId, apiKey);
     this.router.clearCache();
+  }
+
+  private replaceAnalysisController(context: AiTaskContext): AbortController {
+    context.analysisController?.abort(new AiTaskAbortedError());
+    const controller = new AbortController();
+    context.analysisController = controller;
+    return controller;
+  }
+
+  private async streamExecutionAnalysis(params: {
+    sender: WebContents;
+    conversation: AiConversation;
+    conversationId: string;
+    prompt?: string;
+    preserveExecutionState: boolean;
+    appendMessage: boolean;
+    emitFinalEvent?: boolean;
+  }): Promise<string> {
+    const provider = this.getActiveProvider();
+    if (!provider) {
+      throw new Error("未启用 AI 助手或未配置提供商");
+    }
+
+    const apiKey = await this.resolveApiKey(provider);
+    const adapter = this.router.getAdapter(provider, apiKey);
+    const providerRuntimeOptions = this.getProviderRuntimeOptions();
+    const prefs = this.deps.getPreferences();
+    const systemPrompt = prefs.ai.systemPromptOverride?.trim() || SYSTEM_PROMPT;
+    const context = this.getTaskContext(params.conversationId);
+    const analysisController = this.replaceAnalysisController(context);
+
+    const chatMessages = trimMessagesForContext([
+      { role: "system", content: systemPrompt },
+      ...params.conversation.messages.map((m) => ({
+        role: getAiMessageModelRole(m) as "user" | "assistant" | "system",
+        content: m.content,
+      })),
+      ...(params.prompt ? [{ role: "system" as const, content: params.prompt }] : []),
+    ]);
+
+    try {
+      const analysis = await adapter.streamChat(
+        chatMessages,
+        (token) => {
+          this.emitToSender(params.sender, IPCChannel.AiStreamEvent, {
+            conversationId: params.conversationId,
+            type: "token",
+            token,
+            preserveExecutionState: params.preserveExecutionState,
+          } satisfies AiStreamEvent);
+        },
+        {
+          signal: analysisController.signal,
+          timeoutMs: providerRuntimeOptions.timeoutMs,
+          maxRetries: providerRuntimeOptions.maxRetries,
+        }
+      );
+
+      this.ensureTaskNotAborted(params.conversationId);
+
+      if (params.appendMessage) {
+        const analysisMsg: AiChatMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          type: "assistant_reply",
+          content: analysis,
+          timestamp: new Date().toISOString(),
+        };
+        params.conversation.messages.push(analysisMsg);
+        params.conversation.updatedAt = analysisMsg.timestamp;
+        this.queuePersist();
+      }
+
+      if (params.emitFinalEvent !== false) {
+        this.emitToSender(params.sender, IPCChannel.AiStreamEvent, {
+          conversationId: params.conversationId,
+          type: "done",
+          fullContent: analysis,
+          preserveExecutionState: params.preserveExecutionState,
+        } satisfies AiStreamEvent);
+      }
+      return analysis;
+    } finally {
+      const latest = this.taskContexts.get(params.conversationId);
+      if (latest?.analysisController === analysisController) {
+        latest.analysisController = undefined;
+      }
+    }
   }
 
   async chat(sender: WebContents, input: AiChatInput): Promise<{ conversationId: string }> {
@@ -768,6 +907,8 @@ export class AiService {
     const conversationId = conversation.id;
     const prefs = this.deps.getPreferences();
     const timeoutMs = (prefs.ai.executionTimeoutSec ?? 30) * 1000;
+    const startupTimeoutMs = timeoutMs;
+    const idleTimeoutMs = Math.max(timeoutMs, 5 * 60 * 1000);
     const taskContext = this.getTaskContext(conversationId);
     taskContext.aborted = false;
     const executionController = new AbortController();
@@ -780,10 +921,26 @@ export class AiService {
         sessionId: conversation.sessionId,
         plan,
         timeoutMs,
+        startupTimeoutMs,
+        idleTimeoutMs,
         signal: executionController.signal,
         ensureNotAborted: () => this.ensureTaskNotAborted(conversationId),
         onProgress: (event) => this.emitToSender(sender, IPCChannel.AiProgressEvent, event),
-        onStepCompleted: ({ step, exitCode, output, sanitizedOutput, truncated }) => {
+        onStepOutputPreview: ({ step, command, output }) => {
+          const latest = this.taskContexts.get(conversationId);
+          if (!latest) {
+            return;
+          }
+          latest.currentExecution = {
+            step,
+            command,
+            output,
+          };
+        },
+        onTimeoutPrompt: ({ step, timeoutKind }) => (
+          this.requestTimeoutDecision(sender, conversationId, step, timeoutKind)
+        ),
+        onStepCompleted: ({ step, exitCode, sanitizedOutput, truncated, error }) => {
           const resultMessage: AiChatMessage = {
             id: crypto.randomUUID(),
             role: "system",
@@ -795,6 +952,7 @@ export class AiService {
               wasTruncated: truncated.wasTruncated,
               totalLines: truncated.totalLines,
               totalChars: truncated.totalChars,
+              error,
             }),
             timestamp: new Date().toISOString(),
           };
@@ -811,83 +969,60 @@ export class AiService {
         if (executionResult.error) {
           logger.error("[AI] execution run failed", executionResult.error);
         }
-        return;
       }
 
       this.ensureTaskNotAborted(conversationId);
+      const preserveExecutionState = executionResult.status === "failed";
 
-      const analysisStartEvent: AiProgressEvent = {
-        conversationId,
-        type: "analysis_start",
-        status: "running",
-      };
-      this.emitToSender(sender, IPCChannel.AiProgressEvent, analysisStartEvent);
+      if (!preserveExecutionState) {
+        const analysisStartEvent: AiProgressEvent = {
+          conversationId,
+          type: "analysis_start",
+          status: "running",
+        };
+        this.emitToSender(sender, IPCChannel.AiProgressEvent, analysisStartEvent);
+      }
 
       const provider = this.getActiveProvider();
       if (provider) {
-        const apiKey = await this.resolveApiKey(provider);
-        const adapter = this.router.getAdapter(provider, apiKey);
-        const providerRuntimeOptions = this.getProviderRuntimeOptions();
-
-        const prefs = this.deps.getPreferences();
-        const systemPrompt = prefs.ai.systemPromptOverride?.trim() || SYSTEM_PROMPT;
-
-        const chatMessages = trimMessagesForContext([
-          { role: "system", content: systemPrompt },
-          ...conversation.messages.map((m) => ({
-            role: getAiMessageModelRole(m) as "user" | "assistant" | "system",
-            content: m.content,
-          })),
-        ]);
-
-        const analysisController = new AbortController();
-        taskContext.analysisController = analysisController;
-
-        const analysis = await adapter.streamChat(
-          chatMessages,
-          (token) => {
-            this.emitToSender(sender, IPCChannel.AiStreamEvent, {
-              conversationId,
-              type: "token",
-              token,
-            } satisfies AiStreamEvent);
-          },
-          {
-            signal: analysisController.signal,
-            timeoutMs: providerRuntimeOptions.timeoutMs,
-            maxRetries: providerRuntimeOptions.maxRetries,
-          }
-        );
-
-        this.ensureTaskNotAborted(conversationId);
-
-        const newPlan = extractPlanFromResponse(analysis);
-        const analysisMsg: AiChatMessage = {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          type: "assistant_reply",
-          content: analysis,
-          timestamp: new Date().toISOString(),
-          plan: newPlan ?? undefined,
-        };
-        conversation.messages.push(analysisMsg);
-        conversation.updatedAt = analysisMsg.timestamp;
-        this.queuePersist();
-
-        this.emitToSender(sender, IPCChannel.AiStreamEvent, {
+        const analysis = await this.streamExecutionAnalysis({
+          sender,
+          conversation,
           conversationId,
-          type: newPlan ? "plan" : "done",
-          fullContent: analysis,
-          ...(newPlan ? { plan: newPlan } : {}),
-        } satisfies AiStreamEvent);
+          preserveExecutionState,
+          appendMessage: true,
+          emitFinalEvent: false,
+        });
+
+        const latestMessage = conversation.messages[conversation.messages.length - 1];
+        const newPlan = extractPlanFromResponse(analysis);
+        if (newPlan && latestMessage && latestMessage.type === "assistant_reply") {
+          latestMessage.plan = newPlan;
+          this.emitToSender(sender, IPCChannel.AiStreamEvent, {
+            conversationId,
+            type: "plan",
+            fullContent: analysis,
+            preserveExecutionState,
+            plan: newPlan,
+          } satisfies AiStreamEvent);
+        } else {
+          this.emitToSender(sender, IPCChannel.AiStreamEvent, {
+            conversationId,
+            type: "done",
+            fullContent: analysis,
+            preserveExecutionState,
+          } satisfies AiStreamEvent);
+        }
       }
 
-      const allDoneEvent: AiProgressEvent = {
-        conversationId,
-        type: "all_done",
-        summary: plan.summary,
-      };
-      this.emitToSender(sender, IPCChannel.AiProgressEvent, allDoneEvent);
+      if (!preserveExecutionState) {
+        const allDoneEvent: AiProgressEvent = {
+          conversationId,
+          type: "all_done",
+          summary: plan.summary,
+        };
+        this.emitToSender(sender, IPCChannel.AiProgressEvent, allDoneEvent);
+      }
     } catch (err) {
       if (this.isAbortError(err)) {
         return;
@@ -898,6 +1033,8 @@ export class AiService {
       if (currentTask === taskContext) {
         currentTask.executionController = undefined;
         currentTask.analysisController = undefined;
+        currentTask.currentExecution = undefined;
+        currentTask.timeoutPrompt = undefined;
         if (!currentTask.aborted) {
           this.taskContexts.delete(conversationId);
         }
@@ -913,10 +1050,73 @@ export class AiService {
     const context = this.taskContexts.get(input.conversationId);
     if (context) {
       context.aborted = true;
+      context.currentExecution = undefined;
+      context.timeoutPrompt?.resolve("abort");
+      context.timeoutPrompt = undefined;
       context.chatController?.abort(new AiTaskAbortedError());
       context.executionController?.abort(new AiTaskAbortedError());
       context.analysisController?.abort(new AiTaskAbortedError());
     }
+    return { ok: true as const };
+  }
+
+  resolveTimeout(sender: WebContents, input: AiResolveTimeoutInput): { ok: true } {
+    const conversation = this.conversations.get(input.conversationId);
+    if (!conversation) throw new Error("对话不存在");
+    this.assertConversationAccess(conversation, sender, input.clientId);
+    this.bindConversationOwner(conversation, sender, input.clientId);
+    const context = this.taskContexts.get(input.conversationId);
+    context?.timeoutPrompt?.resolve(input.action);
+    if (context) {
+      context.timeoutPrompt = undefined;
+      if (input.action === "abort") {
+        context.currentExecution = undefined;
+      }
+    }
+    return { ok: true as const };
+  }
+
+  async analyzeCurrentExecution(
+    sender: WebContents,
+    input: AiAnalyzeCurrentExecutionInput
+  ): Promise<{ ok: true }> {
+    const conversation = this.conversations.get(input.conversationId);
+    if (!conversation) throw new Error("对话不存在");
+    this.assertConversationAccess(conversation, sender, input.clientId);
+    this.bindConversationOwner(conversation, sender, input.clientId);
+
+    const context = this.taskContexts.get(input.conversationId);
+    const currentExecution = context?.currentExecution;
+    if (!context?.executionController || context.executionController.signal.aborted) {
+      throw new Error("当前没有正在执行的步骤");
+    }
+    if (!currentExecution || currentExecution.output.trim().length === 0) {
+      throw new Error("当前还没有可供分析的执行输出");
+    }
+
+    void this.streamExecutionAnalysis({
+      sender,
+      conversation,
+      conversationId: input.conversationId,
+      prompt: buildProgressAnalysisPrompt({
+        command: currentExecution.command,
+        output: currentExecution.output,
+        step: currentExecution.step,
+      }),
+      preserveExecutionState: true,
+      appendMessage: true,
+    }).catch((err) => {
+      if (this.isAbortError(err)) {
+        return;
+      }
+      logger.error("[AI] current execution analysis failed", err);
+      this.emitToSender(sender, IPCChannel.AiStreamEvent, {
+        conversationId: input.conversationId,
+        type: "error",
+        error: err instanceof Error ? err.message : String(err),
+      } satisfies AiStreamEvent);
+    });
+
     return { ok: true as const };
   }
 
@@ -983,6 +1183,8 @@ export class AiService {
 
   dispose(): void {
     for (const context of this.taskContexts.values()) {
+      context.currentExecution = undefined;
+      context.timeoutPrompt?.resolve("abort");
       context.chatController?.abort(new AiTaskAbortedError());
       context.executionController?.abort(new AiTaskAbortedError());
       context.analysisController?.abort(new AiTaskAbortedError());

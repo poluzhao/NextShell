@@ -77,6 +77,8 @@ import type {
   AiChatInput,
   AiApproveInput,
   AiAbortInput,
+  AiResolveTimeoutInput,
+  AiAnalyzeCurrentExecutionInput,
   AiHistoryInput,
   AiExportConversationInput,
   AiProviderTestInput,
@@ -325,6 +327,8 @@ export interface ServiceContainer {
   aiChat: (sender: WebContents, input: AiChatInput) => Promise<{ conversationId: string }>;
   aiApprove: (sender: WebContents, input: AiApproveInput) => Promise<{ ok: true }>;
   aiAbort: (sender: WebContents, input: AiAbortInput) => { ok: true };
+  aiResolveTimeout: (sender: WebContents, input: AiResolveTimeoutInput) => { ok: true };
+  aiAnalyzeCurrentExecution: (sender: WebContents, input: AiAnalyzeCurrentExecutionInput) => Promise<{ ok: true }>;
   aiHistory: (sender: WebContents, input: AiHistoryInput) => AiConversation[];
   aiExportConversation: (
     sender: WebContents,

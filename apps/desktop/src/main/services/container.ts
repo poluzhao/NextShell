@@ -458,7 +458,7 @@ export const createServiceContainer = (
       try { return await vault.readCredential(`cloud-sync-ws-${wId}`); } catch { return undefined; }
     },
     deleteWorkspacePassword: async (wId) => {
-      await vault.deleteCredential(`cloud-sync-ws-${wId}`).catch(() => {});
+      await vault.deleteCredential(`cloud-sync-ws-${wId}`).catch(() => { });
     },
     getRuntimeCurrentVersion: (wId) => connections.getRuntimeCurrentVersion(wId),
     saveRuntimeCurrentVersion: (wId, v) => connections.saveRuntimeCurrentVersion(wId, v),
@@ -681,6 +681,8 @@ export const createServiceContainer = (
     aiChat: (sender, i) => aiSvc.chat(sender, i),
     aiApprove: (sender, i) => aiSvc.approve(sender, i),
     aiAbort: (sender, i) => aiSvc.abort(sender, i),
+    aiResolveTimeout: (sender, i) => aiSvc.resolveTimeout(sender, i),
+    aiAnalyzeCurrentExecution: (sender, i) => aiSvc.analyzeCurrentExecution(sender, i),
     aiHistory: (sender, i) => aiSvc.history(sender, i),
     aiExportConversation: (sender, i) => aiSvc.exportConversation(sender, i),
     aiTestProvider: (i) => aiSvc.testProvider(i),

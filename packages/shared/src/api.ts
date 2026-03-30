@@ -122,6 +122,8 @@ import type {
   AiChatInput,
   AiApproveInput,
   AiAbortInput,
+  AiResolveTimeoutInput,
+  AiAnalyzeCurrentExecutionInput,
   AiHistoryInput,
   AiExportConversationInput,
   AiProviderTestInput,
@@ -351,6 +353,8 @@ export interface NextShellApi {
     chat: (payload: AiChatInput) => Promise<{ conversationId: string }>;
     approve: (payload: AiApproveInput) => Promise<{ ok: true }>;
     abort: (payload: AiAbortInput) => Promise<{ ok: true }>;
+    resolveTimeout: (payload: AiResolveTimeoutInput) => Promise<{ ok: true }>;
+    analyzeCurrentExecution: (payload: AiAnalyzeCurrentExecutionInput) => Promise<{ ok: true }>;
     history: (payload?: AiHistoryInput) => Promise<AiConversation[]>;
     exportConversation: (payload: AiExportConversationInput) => Promise<{ ok: true; filePath: string } | { ok: false; canceled: true }>;
     testProvider: (payload: AiProviderTestInput) => Promise<{ ok: boolean; error?: string }>;

@@ -56,19 +56,21 @@ export interface AnalysisPromptOptions {
   wasTruncated: boolean;
   totalLines: number;
   totalChars: number;
+  error?: string;
 }
 
 export const buildAnalysisPrompt = (opts: AnalysisPromptOptions): string => {
-  const { command, output, exitCode, wasTruncated, totalLines, totalChars } = opts;
+  const { command, output, exitCode, wasTruncated, totalLines, totalChars, error } = opts;
 
   const truncateNotice = wasTruncated
     ? `\n⚠️ 输出过长（共 ${totalLines} 行 / ${totalChars} 字符），已截取头部和尾部关键内容。如需查看完整输出中的特定部分，请生成执行计划使用管道命令（如 grep、head、tail、awk）提取。\n`
     : "";
+  const errorNotice = error ? `\n错误摘要：${error}\n` : "";
 
   return `刚才执行了命令：\`${command}\`
 
 退出码：${exitCode ?? "未知"}
-${truncateNotice}
+${errorNotice}${truncateNotice}
 输出：
 \`\`\`
 ${output}
@@ -80,4 +82,28 @@ ${output}
 3. 是否需要执行后续操作？
 
 **重要**：如果你建议执行任何后续命令（包括进一步排查、优化、修复等），必须以 JSON 执行计划的格式输出（用 \`\`\`json 代码块包裹），让用户可以审批后再执行。不要只用文字描述建议的命令，所有可执行的建议都必须放入执行计划中。`;
+};
+
+export const buildProgressAnalysisPrompt = (opts: {
+  command: string;
+  output: string;
+  step: number;
+}): string => {
+  return `当前正在执行步骤 ${opts.step}，命令尚未结束：\`${opts.command}\`
+
+以下是截至目前捕获到的阶段性输出：
+\`\`\`
+${opts.output}
+\`\`\`
+
+请基于这份阶段性输出做简要分析：
+1. 当前输出说明命令大概率正在做什么？
+2. 目前是否出现异常迹象、阻塞迹象或需要关注的风险？
+3. 下一步应该重点观察哪些信号？
+
+重要约束：
+- 当前命令还在继续执行，不要假设它已经结束
+- 不要生成 JSON 执行计划
+- 不要建议立刻执行新的命令
+- 只输出文字分析和观察建议，保持简洁`;
 };

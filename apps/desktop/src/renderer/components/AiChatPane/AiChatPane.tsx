@@ -16,6 +16,8 @@ interface AiChatPaneProps {
   connectionLabel?: string;
 }
 
+export const shouldShowPlanCard = (pendingPlan?: AiExecutionPlan): boolean => Boolean(pendingPlan);
+
 export const AiChatPane = ({ sessionId, connectionId, connectionLabel }: AiChatPaneProps) => {
   const { message } = AntdApp.useApp();
   const aiEnabled = usePreferencesStore((s) => s.preferences.ai.enabled);
@@ -55,12 +57,15 @@ export const AiChatPane = ({ sessionId, connectionId, connectionLabel }: AiChatP
     recoveryPlanSourceStep,
     pendingPlan,
     pendingPlanUserRequest,
+    timeoutPrompt,
     showHistory,
     statusHint,
     setConnection,
     sendMessage,
     approvePlan,
     abortExecution,
+    resolveTimeoutPrompt,
+    analyzeCurrentExecution,
     newConversation,
     setShowHistory,
     switchConversation,
@@ -130,6 +135,30 @@ export const AiChatPane = ({ sessionId, connectionId, connectionLabel }: AiChatP
     openRecoveryPlanEditor();
   }, [openRecoveryPlanEditor]);
 
+  const handleContinueWaiting = useCallback(async () => {
+    try {
+      await resolveTimeoutPrompt("continue");
+    } catch (err) {
+      message.error(`继续等待失败：${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  }, [message, resolveTimeoutPrompt]);
+
+  const handleStopWaiting = useCallback(async () => {
+    try {
+      await resolveTimeoutPrompt("abort");
+    } catch (err) {
+      message.error(`终止执行失败：${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  }, [message, resolveTimeoutPrompt]);
+
+  const handleAnalyzeCurrentOutput = useCallback(async () => {
+    try {
+      await analyzeCurrentExecution();
+    } catch (err) {
+      message.error(`分析当前输出失败：${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  }, [analyzeCurrentExecution, message]);
+
   const handleReject = useCallback(() => {
     useAiChatStore.setState({ pendingPlan: undefined });
   }, []);
@@ -194,7 +223,7 @@ export const AiChatPane = ({ sessionId, connectionId, connectionLabel }: AiChatP
 
   const isConfigured = aiEnabled && hasProvider;
   const hasConnection = !!boundConnectionId;
-  const showPlanCard = !!(pendingPlan && !executionProgress);
+  const showPlanCard = shouldShowPlanCard(pendingPlan);
   const showProgressCard = !!executionProgress;
 
   return (
@@ -289,8 +318,13 @@ export const AiChatPane = ({ sessionId, connectionId, connectionLabel }: AiChatP
                       phase={executionPhase}
                       retrySourceStep={recoveryPlanSourceStep}
                       canResume={Boolean(recoveryPlan)}
+                      timeoutPromptStep={timeoutPrompt?.step}
+                      timeoutPromptKind={timeoutPrompt?.kind}
                       onRetry={recoveryPlan ? () => void handleRetryRecoveryPlan() : undefined}
                       onEditRetryPlan={recoveryPlan ? handleEditRecoveryPlan : undefined}
+                      onAnalyzeCurrentOutput={timeoutPrompt ? () => void handleAnalyzeCurrentOutput() : undefined}
+                      onContinueWaiting={timeoutPrompt ? () => void handleContinueWaiting() : undefined}
+                      onStopWaiting={timeoutPrompt ? () => void handleStopWaiting() : undefined}
                     />
                   )}
                 </div>

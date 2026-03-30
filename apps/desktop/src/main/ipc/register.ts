@@ -107,6 +107,8 @@ import {
   aiChatSchema,
   aiApproveSchema,
   aiAbortSchema,
+  aiResolveTimeoutSchema,
+  aiAnalyzeCurrentExecutionSchema,
   aiHistorySchema,
   aiExportConversationSchema,
   aiProviderTestSchema,
@@ -750,6 +752,16 @@ export const registerIpcHandlers = (services: ServiceContainer): void => {
   ipcMain.handle(IPCChannel.AiAbort, (event, payload) => {
     const input = parsePayload(aiAbortSchema, payload, "AI 中止");
     return services.aiAbort(event.sender, input);
+  });
+
+  ipcMain.handle(IPCChannel.AiResolveTimeout, (event, payload) => {
+    const input = parsePayload(aiResolveTimeoutSchema, payload, "AI 超时决策");
+    return services.aiResolveTimeout(event.sender, input);
+  });
+
+  ipcMain.handle(IPCChannel.AiAnalyzeCurrentExecution, (event, payload) => {
+    const input = parsePayload(aiAnalyzeCurrentExecutionSchema, payload, "AI 分析当前输出");
+    return services.aiAnalyzeCurrentExecution(event.sender, input);
   });
 
   ipcMain.handle(IPCChannel.AiHistory, (event, payload) => {

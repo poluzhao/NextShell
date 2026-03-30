@@ -98,14 +98,14 @@ export const sessionAuthOverrideSchema = z.object({
   privateKeyContent: z.preprocess(trimToOptionalString, z.string().min(1).optional()),
   passphrase: z.preprocess(trimToOptionalString, z.string().min(1).optional())
 }).superRefine((value, ctx) => {
-    if ((value.authType === "password" || value.authType === "interactive") && !value.password) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "password is required when authType is password or interactive",
-        path: ["password"]
-      });
-    }
-  });
+  if ((value.authType === "password" || value.authType === "interactive") && !value.password) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "password is required when authType is password or interactive",
+      path: ["password"]
+    });
+  }
+});
 
 const remoteSessionOpenSchema = z.object({
   target: z.literal("remote"),
@@ -1088,6 +1088,17 @@ export const aiAbortSchema = z.object({
   clientId: z.string().trim().min(1).optional(),
 });
 
+export const aiResolveTimeoutSchema = z.object({
+  conversationId: z.string().uuid(),
+  action: z.enum(["continue", "abort"]),
+  clientId: z.string().trim().min(1).optional(),
+});
+
+export const aiAnalyzeCurrentExecutionSchema = z.object({
+  conversationId: z.string().uuid(),
+  clientId: z.string().trim().min(1).optional(),
+});
+
 export const aiHistorySchema = z.object({
   connectionId: z.string().uuid().optional(),
   clientId: z.string().trim().min(1).optional(),
@@ -1113,6 +1124,8 @@ export const aiProviderSetApiKeySchema = z.object({
 export type AiChatInput = z.infer<typeof aiChatSchema>;
 export type AiApproveInput = z.infer<typeof aiApproveSchema>;
 export type AiAbortInput = z.infer<typeof aiAbortSchema>;
+export type AiResolveTimeoutInput = z.infer<typeof aiResolveTimeoutSchema>;
+export type AiAnalyzeCurrentExecutionInput = z.infer<typeof aiAnalyzeCurrentExecutionSchema>;
 export type AiHistoryInput = z.infer<typeof aiHistorySchema>;
 export type AiExportConversationInput = z.infer<typeof aiExportConversationSchema>;
 export type AiProviderTestInput = z.infer<typeof aiProviderTestSchema>;
@@ -1123,6 +1136,7 @@ export interface AiStreamEvent {
   type: "token" | "plan" | "done" | "error";
   token?: string;
   fullContent?: string;
+  preserveExecutionState?: boolean;
   plan?: {
     steps: Array<{ step: number; command: string; description: string; risky: boolean }>;
     summary: string;
@@ -1132,11 +1146,12 @@ export interface AiStreamEvent {
 
 export interface AiProgressEvent {
   conversationId: string;
-  type: "step_start" | "step_output" | "step_done" | "all_done" | "analysis_start" | "error";
+  type: "step_start" | "step_probe" | "step_output" | "step_done" | "timeout_prompt" | "all_done" | "analysis_start" | "error";
   step?: number;
   command?: string;
   output?: string;
   status?: "running" | "success" | "failed";
   error?: string;
   summary?: string;
+  timeoutKind?: "startup" | "idle" | "runtime";
 }
